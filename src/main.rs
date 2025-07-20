@@ -3,6 +3,7 @@ use anyhow::Result;
 use mal_api::prelude::*;
 use crunchyroll_rs::{Crunchyroll, Locale};
 use crunchyroll_rs::common::StreamExt;
+use reqwest::Response;
 use std::{collections::HashSet, env, thread, time::Duration};
 
 fn get_node_title(node: AnimeFields) -> String {
@@ -78,18 +79,38 @@ async fn read_mal_entries() -> Result<Vec<AnimeListNode>> {
     Ok(output)
 }
 
-fn is_prefix(p: &str, s: &str) -> bool {
+fn same_title(p: &str, s: &str) -> bool {
     let n = p.len();
-    if s.len() < n {
+    if s.len() < n || n == 0 {
         return false;
     }
-    return p == &s[..n];
+
+    /*
+        We need the minimal edit distance here because there is
+        discrepancies between MAL's naming & CR's naming.
+        Ex.:
+            - hitoribocchi no marumaru seikatsu vs. hitoribocchi no marumaruseikatsu
+            - ...
+        And the 0.125 value is just a guess. For a 20 letters title,
+        the maximum distance is 2.
+     */
+    let score = (levenshtein::levenshtein(p, &s[..n]) as f32) / (n as f32);
+    if score > 0.125 {
+        return false;
+    }
+
+    if score >= 0.01 {
+        eprintln!("[WARNING] {} => {} ({} {})", s, p,
+            score,
+            levenshtein::levenshtein(p, &s[..n])
+        );
+    }
+    true
 }
 
 struct MarkAsWatch<'a> {
     crunchyroll: &'a Crunchyroll,
     account_uuid: String,
-    bearer_token_last_update: std::time::Instant,
     current_bearer_token: String,
     preferred_audio: String,
     locale: String
@@ -105,7 +126,6 @@ impl<'a> MarkAsWatch<'a> {
             crunchyroll: &crunchyroll,
             account_uuid: account.account_id,
             current_bearer_token: "".to_string(),
-            bearer_token_last_update: std::time::Instant::now(),
             preferred_audio: preferred_audio.to_string(),
             locale: locale.to_string(),
         };
@@ -115,21 +135,11 @@ impl<'a> MarkAsWatch<'a> {
     }
 
     async fn update_token(&mut self) -> Result<()> {
-        let now = std::time::Instant::now();
-        if self.current_bearer_token.len() > 0 &&
-            (now - self.bearer_token_last_update) < std::time::Duration::from_secs(5*60)
-        {
-            return Ok(());
-        }
-
         self.current_bearer_token = self.crunchyroll.access_token().await;
-        self.bearer_token_last_update = now;
         Ok(())
     }
 
-    async fn mark(&mut self, content_id: &String) -> Result<()> {
-        self.update_token().await?;
-
+    async fn _mark_internal(&mut self, content_id: &String) -> Result<Response> {
         let query = self.crunchyroll.client().post(
             format!("https://www.crunchyroll.com/content/v2/discover/{}/mark_as_watched/{}?preferred_audio_language={}&locale={}",
                 self.account_uuid,
@@ -141,10 +151,24 @@ impl<'a> MarkAsWatch<'a> {
             .bearer_auth(&self.current_bearer_token)
             .build()?;
     
-        self.crunchyroll.client()
+        Ok(self.crunchyroll.client()
             .execute(query)
             .await?
-            .error_for_status()?;
+        )
+    }
+
+    async fn mark(&mut self, content_id: &String) -> Result<()> {
+        let res = self._mark_internal(content_id).await?;
+    
+        if res.status().as_u16() == 401 {
+            self.update_token().await?;
+
+            self._mark_internal(content_id)
+                .await?
+                .error_for_status()?;
+        } else {
+            res.error_for_status()?;
+        }
         Ok(())
     }
 }
@@ -193,14 +217,14 @@ async fn main() -> Result<()> {
         if let Some(s) = query_result.series.next().await {
             let series = s?;
     
-            if is_prefix(&series.title.to_lowercase(), &title) {
+            if same_title(&series.title.to_lowercase(), &title) {
                 let seasons = series.seasons().await?;
                 for season in seasons {
                     if treated_ids.contains(&season.id) {
                         continue;
                     }
 
-                    if season.title.to_lowercase() != title {
+                    if !same_title(season.title.to_lowercase().as_str(), title.as_str()) {
                         continue;
                     }
 
