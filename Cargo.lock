@@ -1171,6 +1171,7 @@ name = "mal-2-crunchyroll"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "crunchyroll-rs",
  "dotenvy",
  "levenshtein",

@@ -1,3 +1,4 @@
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use dotenvy;
 use anyhow::Result;
 use mal_api::prelude::*;
@@ -40,7 +41,8 @@ async fn read_mal_entries() -> Result<Vec<AnimeListNode>> {
             .fields(&AnimeCommonFields(vec![
                 AnimeField::list_status,
                 AnimeField::title,
-                AnimeField::alternative_titles
+                AnimeField::alternative_titles,
+                AnimeField::start_date
             ]))
             .sort(UserAnimeListSort::AnimeStartDate)
             .build()?;
@@ -84,7 +86,6 @@ fn same_title(p: &str, s: &str) -> bool {
     if s.len() < n || n == 0 {
         return false;
     }
-
     /*
         We need the minimal edit distance here because there is
         discrepancies between MAL's naming & CR's naming.
@@ -95,17 +96,15 @@ fn same_title(p: &str, s: &str) -> bool {
         the maximum distance is 2.
      */
     let score = (levenshtein::levenshtein(p, &s[..n]) as f32) / (n as f32);
-    if score > 0.125 {
-        return false;
-    }
-
+    
     if score >= 0.01 {
         eprintln!("[WARNING] {} => {} ({} {})", s, p,
             score,
             levenshtein::levenshtein(p, &s[..n])
         );
     }
-    true
+
+    score <= 0.125
 }
 
 struct MarkAsWatch<'a> {
@@ -173,6 +172,46 @@ impl<'a> MarkAsWatch<'a> {
     }
 }
 
+fn parse_date(x: &String) -> NaiveDate {
+    let mut year: i32 = 0;
+    let mut month: u32 = 0;
+    let mut day: u32 = 0;
+
+    let mut txt = x.chars();
+
+    for c in &mut txt {
+        if c.is_digit(10) {
+            year = 10 * year + c.to_digit(10).unwrap() as i32;
+            continue;
+        }
+        if c == '-' {
+            break;
+        }
+        panic!("Invalid character in year {}", x);
+    }
+
+    for c in &mut txt {
+        if c.is_digit(10) {
+            month = 10 * month + c.to_digit(10).unwrap();
+            continue;
+        }
+        if c == '-' {
+            break;
+        }
+        panic!("Invalid character in month: {}", x);
+    }
+
+    for c in &mut txt {
+        if c.is_digit(10) {
+            day = 10 * day + c.to_digit(10).unwrap();
+            continue;
+        }
+        panic!("Invalid character in day: {}", x);
+    }
+
+    NaiveDate::from_ymd_opt(year, month.max(1), day.max(1)).unwrap()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -203,29 +242,63 @@ async fn main() -> Result<()> {
     ).await?;
 
     let mut treated_ids = HashSet::<String>::new();
-    for elt in read_mal_entries().await? {
+    let animes = read_mal_entries().await?;
+    let max_date_difference = chrono::TimeDelta::days(2*30);
+
+    for elt in animes {
         let (node, status) = (elt.node, elt.list_status);
+        let air_start_date: Option<DateTime<Utc>> = 
+            match node.start_date.as_ref() {
+            None => None,
+            Some(x) => {
+                Utc.from_local_datetime(&NaiveDateTime::new(
+                    parse_date(x),
+                    NaiveTime::default()
+                )).single()
+            }
+            };
         // We can do it, the status-less entries
         // have been filtered
         let status = status.unwrap();
 
         let title = get_node_title(node).to_lowercase();
+
         eprintln!("Querying {}", &title);
         let mut found = false;
 
         let mut query_result = crunchyroll.query(&title);
         if let Some(s) = query_result.series.next().await {
             let series = s?;
+            eprintln!("Result '{}' '{}'", &series.title.to_lowercase(), &title);
     
             if same_title(&series.title.to_lowercase(), &title) {
-                let seasons = series.seasons().await?;
-                for season in seasons {
+                let seasons: Vec<crunchyroll_rs::Season> = series.seasons().await?;
+                'SEASON: for season in seasons {
                     if treated_ids.contains(&season.id) {
                         continue;
                     }
 
-                    if !same_title(season.title.to_lowercase().as_str(), title.as_str()) {
-                        continue;
+                    if season.title.to_lowercase().as_str() != title.as_str() {
+                        let mut valid_season = false;
+
+                        if let Some(date) = air_start_date {
+                            for episode in season.episodes().await? {
+                                if (episode.episode_air_date - date).abs() < max_date_difference {
+                                    valid_season = true;
+                                    break;
+                                }
+
+                                if episode.episode_air_date >= (date+max_date_difference) {
+                                    break 'SEASON;
+                                }
+                            }    
+                        } else {
+                            eprintln!("[WARNING] No date has been found");
+                        }
+                        
+                        if !valid_season {
+                            continue;
+                        }
                     }
 
                     found = true;
@@ -254,6 +327,7 @@ async fn main() -> Result<()> {
                         }    
                     }
                     treated_ids.insert(season.title);
+                    break;
                 }
             }
         }    
