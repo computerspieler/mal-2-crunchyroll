@@ -1,0 +1,10 @@
+[package]
+name = "mal-2-crunchyroll"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crunchyroll-rs = "0.14.0"
+dotenvy = "0.15.7"
+mal-api = { git = "https://github.com/computerspieler/mal-rs.git", branch = "main", features = ["user"] }
+tokio = { version = "1.46.1", features = ["macros", "rt-multi-thread"] }
